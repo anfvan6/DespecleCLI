@@ -1,0 +1,18 @@
+Удаление мелких чёрных точек из чёрно-белого изображения.
+
+Использование:
+  despeckle.exe input output maxArea [connectivity] [threshold] [-i|--invert]
+
+Параметры:
+  input        входной файл: png, bmp, tif, jpg и т.п.
+  output       выходной файл; формат определяется по расширению
+  maxArea      удалять чёрные связные компоненты с площадью <= maxArea пикселей
+  connectivity 4 или 8; по умолчанию 8
+  threshold    порог бинаризации 1..255; по умолчанию 128
+  -i, --invert инвертировать логику: удалять светлые точки на тёмном фоне,
+               но вернуть исходную полярность в результате
+
+Примеры:
+  despeckle.exe page.png clean.png 20
+  despeckle.exe page.tif clean.tif 35 8 160
+  despeckle.exe page.png clean.png 25 8 128 --invert

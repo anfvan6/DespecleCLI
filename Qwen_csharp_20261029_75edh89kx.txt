@@ -1,0 +1,657 @@
+### USER
+Нужно написать (или найти) консольное приложение для windows, которое бы удаляло мелкие черные точки из черно-белого изображения (таким образом, каким это делают scan tailor и scankromsator).
+
+### ASSISTANT
+Такая задача обычно делается так: изображение бинаризуется, затем находятся связные компоненты чёрных пикселей, и компоненты с маленькой площадью удаляются. Это близко к тому, что делают despeckle-фильтры в Scan Tailor / ScanKromsator.
+
+Ниже дам два варианта:
+
+1. **Быстрый готовый вариант через ImageMagick** — если не хочется компилировать.
+2. **Готовый исходник консольного приложения для Windows** на C#/.NET Framework, который удаляет именно мелкие чёрные компоненты по площади.
+
+---
+
+## 1. Быстрый вариант: ImageMagick
+
+Установите ImageMagick для Windows. В командной строке можно использовать такие команды.
+
+### Простой медианный фильтр против одиночных точек
+
+Для ImageMagick 7:
+
+```bat
+magick in.png -colorspace Gray -threshold 50% -statistic Median 3x3 -threshold 50% out.png
+```
+
+Для ImageMagick 6 вместо `magick` обычно используется `convert`:
+
+```bat
+convert in.png -colorspace Gray -threshold 50% -statistic Median 3x3 -threshold 50% out.png
+```
+
+Это хорошо убирает одиночные пиксели, но может плохо работать с точками размером 2×2, 3×3 и т.п.
+
+### Морфологический способ
+
+Чёрные точки на белом фоне можно убрать так:
+
+```bat
+magick in.png -colorspace Gray -threshold 50% -negate -morphology Open Diamond:1 -negate -threshold 50% out.png
+```
+
+Смысл:
+
+- `-threshold 50%` — делаем изображение бинарным;
+- `-negate` — чёрные точки становятся белыми на чёрном фоне;
+- `-morphology Open Diamond:1` — удаляет мелкие белые объекты;
+- `-negate` — возвращаем обратно;
+- `-threshold 50%` — снова делаем жёсткое ч/б.
+
+Если точки крупнее, можно пробовать `Disk:1`, `Square:1`, `Diamond:2` и т.д. Но морфология может повреждать тонкие линии и мелкие детали текста.
+
+Более точный способ — удаление связных компонент по площади. Для этого можно использовать код ниже.
+
+---
+
+## 2. Своё консольное приложение для Windows
+
+Ниже полный исходник на C#. Он:
+
+- читает PNG/BMP/TIFF/JPG и другие форматы, которые понимает `System.Drawing`;
+- переводит изображение в чёрно-белое по порогу;
+- находит связные компоненты чёрных пикселей;
+- удаляет компоненты, у которых площадь `<= maxArea`;
+- сохраняет результат как 1-битное изображение;
+- умеет работать с инверсией, если нужно удалять светлые точки на тёмном фоне.
+
+### Исходный код `despeckle.cs`
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+
+class Despeckle
+{
+    static int Main(string[] args)
+    {
+        var positional = new List<string>();
+        bool invert = false;
+
+        foreach (var arg in args)
+        {
+            if (arg == "-i" || arg == "--invert")
+            {
+                invert = true;
+            }
+            else if (arg == "-h" || arg == "--help")
+            {
+                PrintUsage();
+                return 0;
+            }
+            else
+            {
+                positional.Add(arg);
+            }
+        }
+
+        if (positional.Count < 3)
+        {
+            PrintUsage();
+            return 1;
+        }
+
+        string input = positional[0];
+        string output = positional[1];
+
+        int maxArea;
+        if (!int.TryParse(positional[2], out maxArea) || maxArea < 0)
+        {
+            Console.Error.WriteLine("maxArea должен быть целым числом >= 0");
+            return 1;
+        }
+
+        int connectivity = 8;
+        if (positional.Count > 3)
+        {
+            if (!int.TryParse(positional[3], out connectivity) || (connectivity != 4 && connectivity != 8))
+            {
+                Console.Error.WriteLine("connectivity может быть 4 или 8");
+                return 1;
+            }
+        }
+
+        int threshold = 128;
+        if (positional.Count > 4)
+        {
+            if (!int.TryParse(positional[4], out threshold) || threshold < 1 || threshold > 255)
+            {
+                Console.Error.WriteLine("threshold должен быть в диапазоне 1..255");
+                return 1;
+            }
+        }
+
+        try
+        {
+            ProcessImage(input, output, maxArea, connectivity, threshold, invert);
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine("Ошибка: " + ex.Message);
+            return 2;
+        }
+    }
+
+    static void PrintUsage()
+    {
+        Console.WriteLine("Удаление мелких чёрных точек из чёрно-белого изображения.");
+        Console.WriteLine();
+        Console.WriteLine("Использование:");
+        Console.WriteLine("  despeckle.exe input output maxArea [connectivity] [threshold] [-i|--invert]");
+        Console.WriteLine();
+        Console.WriteLine("Параметры:");
+        Console.WriteLine("  input        входной файл: png, bmp, tif, jpg и т.п.");
+        Console.WriteLine("  output       выходной файл; формат определяется по расширению");
+        Console.WriteLine("  maxArea      удалять чёрные связные компоненты с площадью <= maxArea пикселей");
+        Console.WriteLine("  connectivity 4 или 8; по умолчанию 8");
+        Console.WriteLine("  threshold    порог бинаризации 1..255; по умолчанию 128");
+        Console.WriteLine("  -i, --invert инвертировать логику: удалять светлые точки на тёмном фоне,");
+        Console.WriteLine("               но вернуть исходную полярность в результате");
+        Console.WriteLine();
+        Console.WriteLine("Примеры:");
+        Console.WriteLine("  despeckle.exe page.png clean.png 20");
+        Console.WriteLine("  despeckle.exe page.tif clean.tif 35 8 160");
+        Console.WriteLine("  despeckle.exe page.png clean.png 25 8 128 --invert");
+    }
+
+    static void ProcessImage(string input, string output, int maxArea, int connectivity, int threshold, bool invert)
+    {
+        using (Bitmap src = new Bitmap(input))
+        {
+            int w = src.Width;
+            int h = src.Height;
+
+            long pixelCount = (long)w * h;
+            if (pixelCount > int.MaxValue)
+            {
+                throw new InvalidOperationException("Изображение слишком большое для обработки этим инструментом.");
+            }
+
+            byte[] mask = LoadBinaryMask(src, w, h, threshold, invert);
+            RemoveSmallBlackComponents(mask, w, h, maxArea, connectivity);
+
+            if (invert)
+            {
+                InvertMask(mask);
+            }
+
+            using (Bitmap dst = Create1bppBitmap(mask, w, h))
+            {
+                try
+                {
+                    dst.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+                }
+                catch
+                {
+                    // Если формат или DPI некорректны, просто игнорируем.
+                }
+
+                ImageFormat fmt = GetImageFormat(output);
+
+                // JPEG плохо подходит для 1-битной графики.
+                // Если очень нужно, сохраняем через 24-битную копию.
+                if (fmt == ImageFormat.Jpeg)
+                {
+                    using (Bitmap rgb = new Bitmap(dst.Width, dst.Height, PixelFormat.Format24bppRgb))
+                    {
+                        using (Graphics g = Graphics.FromImage(rgb))
+                        {
+                            g.Clear(Color.White);
+                            g.DrawImage(dst, 0, 0, dst.Width, dst.Height);
+                        }
+
+                        try
+                        {
+                            rgb.SetResolution(dst.HorizontalResolution, dst.VerticalResolution);
+                        }
+                        catch
+                        {
+                        }
+
+                        rgb.Save(output, fmt);
+                    }
+                }
+                else
+                {
+                    dst.Save(output, fmt);
+                }
+            }
+        }
+    }
+
+    static byte[] LoadBinaryMask(Bitmap src, int w, int h, int threshold, bool invert)
+    {
+        byte[] mask = new byte[w * h];
+
+        using (Bitmap bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb))
+        {
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.White);
+                g.DrawImage(src, 0, 0, w, h);
+            }
+
+            Rectangle rect = new Rectangle(0, 0, w, h);
+            BitmapData data = bmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+
+            unsafe
+            {
+                byte* basePtr = (byte*)data.Scan0;
+                int stride = data.Stride;
+
+                for (int y = 0; y < h; y++)
+                {
+                    byte* p = basePtr + y * stride;
+                    int rowStart = y * w;
+
+                    for (int x = 0; x < w; x++, p += 4)
+                    {
+                        int blue = p[0];
+                        int green = p[1];
+                        int red = p[2];
+
+                        // ITU-R BT.601 luma, целочисленно:
+                        // (R * 77 + G * 150 + B * 29) / 256
+                        int luminance = (red * 77 + green * 150 + blue * 29) >> 8;
+
+                        bool isObject;
+                        if (invert)
+                        {
+                            // Светлые объекты считаются "чёрными" для удаления.
+                            isObject = luminance >= threshold;
+                        }
+                        else
+                        {
+                            // Обычный случай: чёрные точки на белом фоне.
+                            isObject = luminance < threshold;
+                        }
+
+                        mask[rowStart + x] = isObject ? (byte)1 : (byte)0;
+                    }
+                }
+            }
+
+            bmp.UnlockBits(data);
+        }
+
+        return mask;
+    }
+
+    static void RemoveSmallBlackComponents(byte[] mask, int w, int h, int maxArea, int connectivity)
+    {
+        if (maxArea <= 0)
+        {
+            return;
+        }
+
+        int total = w * h;
+
+        // Очередь для обхода связной компоненты.
+        // Сначала выделяем разумный кусок, при необходимости увеличим.
+        int[] queue = new int[Math.Min(total, 1 << 20)];
+
+        var componentPixels = new List<int>();
+
+        int[] dx;
+        int[] dy;
+
+        if (connectivity == 4)
+        {
+            dx = new int[] { 1, -1, 0, 0 };
+            dy = new int[] { 0, 0, 1, -1 };
+        }
+        else
+        {
+            dx = new int[] { -1, -1, -1, 0, 0, 1, 1, 1 };
+            dy = new int[] { -1, 0, 1, -1, 1, -1, 0, 1 };
+        }
+
+        for (int i = 0; i < total; i++)
+        {
+            if (mask[i] != 1)
+            {
+                continue;
+            }
+
+            int head = 0;
+            int tail = 0;
+
+            mask[i] = 2; // 2 = уже посещённый чёрный пиксель
+            queue[tail++] = i;
+
+            int area = 0;
+            bool storePixels = true;
+            componentPixels.Clear();
+
+            while (head < tail)
+            {
+                int idx = queue[head++];
+                area++;
+
+                if (storePixels)
+                {
+                    componentPixels.Add(idx);
+
+                    // Если компонента уже больше maxArea, дальше хранить её пиксели не нужно.
+                    if (componentPixels.Count > maxArea)
+                    {
+                        storePixels = false;
+                        componentPixels.Clear();
+                    }
+                }
+
+                int x = idx % w;
+                int y = idx / w;
+
+                for (int k = 0; k < dx.Length; k++)
+                {
+                    int nx = x + dx[k];
+                    int ny = y + dy[k];
+
+                    if ((uint)nx < (uint)w && (uint)ny < (uint)h)
+                    {
+                        int ni = ny * w + nx;
+
+                        if (mask[ni] == 1)
+                        {
+                            mask[ni] = 2;
+
+                            if (tail == queue.Length)
+                            {
+                                long doubled = (long)queue.Length * 2;
+                                int newLength = (int)Math.Min((long)total, doubled);
+
+                                if (newLength <= queue.Length)
+                                {
+                                    newLength = total;
+                                }
+
+                                Array.Resize(ref queue, newLength);
+                            }
+
+                            queue[tail++] = ni;
+                        }
+                    }
+                }
+            }
+
+            // Если компонента маленькая, удаляем её.
+            if (area <= maxArea)
+            {
+                for (int j = 0; j < componentPixels.Count; j++)
+                {
+                    mask[componentPixels[j]] = 0;
+                }
+            }
+        }
+
+        // Возвращаем посещённым чёрным пикселям состояние 1.
+        for (int i = 0; i < total; i++)
+        {
+            if (mask[i] == 2)
+            {
+                mask[i] = 1;
+            }
+        }
+    }
+
+    static void InvertMask(byte[] mask)
+    {
+        for (int i = 0; i < mask.Length; i++)
+        {
+            mask[i] = (byte)(mask[i] == 0 ? 1 : 0);
+        }
+    }
+
+    static Bitmap Create1bppBitmap(byte[] mask, int w, int h)
+    {
+        Bitmap bmp = new Bitmap(w, h, PixelFormat.Format1bppIndexed);
+
+        ColorPalette palette = bmp.Palette;
+        if (palette.Entries.Length >= 2)
+        {
+            palette.Entries[0] = Color.White;
+            palette.Entries[1] = Color.Black;
+            bmp.Palette = palette;
+        }
+
+        Rectangle rect = new Rectangle(0, 0, w, h);
+        BitmapData data = bmp.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format1bppIndexed);
+
+        unsafe
+        {
+            byte* basePtr = (byte*)data.Scan0;
+            int stride = data.Stride;
+
+            for (int y = 0; y < h; y++)
+            {
+                byte* row = basePtr + y * stride;
+
+                // Обнуляем строку вместе с padding-байтами.
+                // В нашей палитре 0 = белый.
+                for (int i = 0; i < stride; i++)
+                {
+                    row[i] = 0;
+                }
+
+                int rowStart = y * w;
+
+                for (int x = 0; x < w; x++)
+                {
+                    if (mask[rowStart + x] == 1)
+                    {
+                        // В 1bpp DIB/GDI+ левый пиксель — старший бит.
+                        row[x >> 3] |= (byte)(0x80 >> (x & 7));
+                    }
+                }
+            }
+        }
+
+        bmp.UnlockBits(data);
+        return bmp;
+    }
+
+    static ImageFormat GetImageFormat(string path)
+    {
+        string ext = Path.GetExtension(path);
+
+        if (string.IsNullOrEmpty(ext))
+        {
+            return ImageFormat.Png;
+        }
+
+        switch (ext.ToLowerInvariant())
+        {
+            case ".bmp":
+                return ImageFormat.Bmp;
+
+            case ".jpg":
+            case ".jpeg":
+                return ImageFormat.Jpeg;
+
+            case ".tif":
+            case ".tiff":
+                return ImageFormat.Tiff;
+
+            case ".gif":
+                return ImageFormat.Gif;
+
+            default:
+                return ImageFormat.Png;
+        }
+    }
+}
+```
+
+---
+
+## Как скомпилировать в Windows
+
+### Вариант 1: через встроенный .NET Framework
+
+Сохраните код в файл `despeckle.cs`, затем выполните в `cmd`:
+
+```bat
+"%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /optimize /unsafe /target:exe /out:despeckle.exe /reference:System.Drawing.dll despeckle.cs
+```
+
+Если 64-битной папки нет, попробуйте 32-битную:
+
+```bat
+"%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe" /nologo /optimize /unsafe /target:exe /out:despeckle.exe /reference:System.Drawing.dll despeckle.cs
+```
+
+После этого появится `despeckle.exe`.
+
+### Вариант 2: через Visual Studio / Developer Command Prompt
+
+Если установлен Visual Studio или Build Tools, можно в Developer Command Prompt выполнить:
+
+```bat
+csc /nologo /optimize /unsafe /target:exe /out:despeckle.exe /reference:System.Drawing.dll despeckle.cs
+```
+
+Либо создайте проект `Console App (.NET Framework)`, вставьте код, добавьте ссылку на `System.Drawing`, включите `Allow unsafe code` в свойствах проекта и соберите.
+
+---
+
+## Использование
+
+```bat
+despeckle.exe input.png output.png 20
+```
+
+Это удалит чёрные связные компоненты площадью до 20 пикселей включительно.
+
+Полная форма:
+
+```bat
+despeckle.exe input output maxArea [connectivity] [threshold] [-i|--invert]
+```
+
+Параметры:
+
+| Параметр | Назначение |
+|---|---|
+| `input` | входной файл |
+| `output` | выходной файл |
+| `maxArea` | удалять чёрные компоненты площадью `<= maxArea` пикселей |
+| `connectivity` | `4` или `8`; по умолчанию `8` |
+| `threshold` | порог бинаризации, `1..255`; по умолчанию `128` |
+| `-i`, `--invert` | удалять светлые точки на тёмном фоне, но вернуть исходную полярность |
+
+Примеры:
+
+```bat
+despeckle.exe page.png clean.png 20
+```
+
+```bat
+despeckle.exe page.tif clean.tif 40 8 160
+```
+
+```bat
+despeckle.exe dark_background.png clean.png 30 8 128 --invert
+```
+
+---
+
+## Пакетная обработка
+
+Например, обработать все PNG из папки `input` в папку `output`:
+
+```bat
+@echo off
+setlocal
+
+if not exist output mkdir output
+
+for %%F in (input\*.png) do (
+    despeckle.exe "%%F" "output\%%~nxF" 20 8 128
+)
+
+echo Готово.
+pause
+```
+
+Для TIFF:
+
+```bat
+for %%F in (input\*.tif) do (
+    despeckle.exe "%%F" "output\%%~nxF" 35 8 128
+)
+```
+
+---
+
+## Как подбирать параметры
+
+### `maxArea`
+
+Это главный параметр.
+
+Ориентировочно:
+
+- для 300 dpi можно начать с `5..20`;
+- для 600 dpi можно начать с `20..80`;
+- для 1200 dpi значения могут быть в 4 раза больше, чем для 600 dpi, потому что площадь растёт квадратично.
+
+Если точки остаются — увеличивайте `maxArea`.
+
+Если начинают пропадать точки над «і», запятые, точки в конце предложений или мелкие детали текста — уменьшайте `maxArea`.
+
+### `threshold`
+
+По умолчанию `128`.
+
+- Если серый мусор воспринимается как чёрный и удаляется неправильно, попробуйте уменьшить порог, например `100`.
+- Если текст бледный и часть букв/точек не воспринимается как чёрное, попробуйте увеличить порог, например `160` или `180`.
+
+Для уже бинарных изображений `threshold` обычно не критичен.
+
+### `connectivity`
+
+`8` учитывает диагональные соседи. Обычно это лучше для точек и шума.
+
+`4` учитывает только вверх/вниз/влево/вправо. Иногда помогает, если диагональный шум «прилипает» к тексту при 8-связности, но может хуже работать на тонких диагональных линиях.
+
+---
+
+## Важные замечания
+
+1. **Лучшие выходные форматы:** PNG, TIFF, BMP.  
+   JPEG не подходит для 1-битной графики, хотя программа и умеет сохранять JPEG через 24-битную копию.
+
+2. **DPI сохраняется по возможности.**  
+   Программа пытается скопировать разрешение из исходного файла, но не все форматы одинаково хорошо хранят DPI.
+
+3. **Многостраничные TIFF.**  
+   Этот код обрабатывает только первую страницу многостраничного TIFF. Если нужно обработать многостраничный TIFF, нужно либо предварительно разбить его на страницы, либо дорабатывать код.
+
+4. **Прилипшие к тексту точки.**  
+   Если чёрная точка касается буквы и становится частью большой связной компоненты, она не будет удалена. Это нормально для connected-component-подхода. В таких случаях иногда помогает морфология, но она может портить текст.
+
+5. **Память.**  
+   Для очень больших сканов программе может понадобиться много памяти, потому что изображение временно раскладывается в 32-битный буфер и массив связных компонент. Для обычных 300/600 dpi страниц это обычно не проблема.
+
+---
+
+Если нужен именно готовый `.exe`, проще всего скомпилировать этот код на любой Windows с .NET Framework. Если хотите, могу также сделать вариант на Python + Pillow/OpenCV и показать, как упаковать его в один Windows `.exe` через PyInstaller.
+
+### USER
+на выходе изображения инвертированы. нужно исправить. вывод tiff должен быть CCITT Group 4
+
+### ASSISTANT
